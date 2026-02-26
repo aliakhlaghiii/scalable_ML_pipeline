@@ -1,5 +1,4 @@
 from snakemake.script import snakemake  # type: ignore
-
 from pathlib import Path
 import sys
 import numpy as np
@@ -13,20 +12,17 @@ from config import load_paths
 
 ID_COL = "id"
 
-
 def coerce_id(df: pd.DataFrame, name: str) -> pd.DataFrame:
     if ID_COL not in df.columns:
         raise KeyError(f"{name}: missing ID column '{ID_COL}'")
 
-    # هر چیزی مثل "NBB 1982-016" -> "1982016"
     df[ID_COL] = (
         df[ID_COL]
         .astype(str)
         .str.strip()
         .str.replace(r"\D+", "", regex=True)
     )
-
-    # اگر چیزی خالی شد، همونجا خطا بده
+    # check for any bad ids (empty or non-numeric after coercion)
     bad = df[ID_COL].eq("") | df[ID_COL].isna()
     if bad.any():
         i = bad.idxmax()
@@ -50,16 +46,12 @@ def numeric_only(df: pd.DataFrame) -> pd.DataFrame:
     return df.select_dtypes(include=[np.number]).copy()
 
 
-# -----------------------
-# Inputs
-# -----------------------
+# inputs
 delta_path = snakemake.input.delta
 a_path = snakemake.input.a
 b_path = snakemake.input.b
 
-# -----------------------
 # Load radiomics first (so we can fallback-create clinical if needed)
-# -----------------------
 D = pd.read_parquet(delta_path)
 A = pd.read_parquet(a_path)
 B = pd.read_parquet(b_path)
@@ -67,7 +59,6 @@ B = pd.read_parquet(b_path)
 # Normalize radiomics id
 for df, nm in [(D, "delta_radiomics"), (A, "radiomics_A"), (B, "radiomics_B")]:
     if ID_COL not in df.columns:
-        # sometimes index got stored; be strict
         raise ValueError(f"{nm} missing '{ID_COL}' column.")
 
 D = coerce_id(D, "delta_radiomics")
@@ -79,9 +70,7 @@ rad_ids = sorted(set(D[ID_COL]) & set(A[ID_COL]) & set(B[ID_COL]))
 if len(rad_ids) < 5:
     raise ValueError(f"Radiomics cohort too small: {len(rad_ids)}")
 
-# -----------------------
 # Config + clinical
-# -----------------------
 _, clinical_path = load_paths(snakemake.params.config)
 
 clinic = None
@@ -90,9 +79,7 @@ try:
 except Exception:
     clinic = None
 
-# -----------------------
 # Detect/normalize clinical ID (fallback if missing)
-# -----------------------
 if clinic is None:
     clinic = pd.DataFrame({ID_COL: rad_ids})
 
@@ -115,9 +102,7 @@ else:
 
 clinic = coerce_id(clinic, "clinical")
 
-# -----------------------
 # Align common cohort (intersection with radiomics)
-# -----------------------
 common_ids = sorted(set(clinic[ID_COL]) & set(rad_ids))
 if len(common_ids) < 5:
     # fallback again: just use radiomics ids
@@ -137,9 +122,7 @@ if not (clinic_c[ID_COL].values == B_c[ID_COL].values).all():
 if not (clinic_c[ID_COL].values == D_c[ID_COL].values).all():
     clinic_c = clinic_c.set_index(ID_COL).loc[D_c[ID_COL].values].reset_index()
 
-# -----------------------
 # Select label -> target (fallback if missing)
-# -----------------------
 label_candidates = list(snakemake.params.label_candidates) if snakemake.params.label_candidates else []
 label_col = next((c for c in label_candidates if c in clinic_c.columns), None)
 
@@ -150,9 +133,7 @@ if label_col is None:
 else:
     y = clinic_c[label_col].astype(int).rename("target")
 
-# -----------------------
 # Clinical features (numeric-only; fallback to constant feature if empty)
-# -----------------------
 raw_date_cols = list(snakemake.params.raw_date_cols) if snakemake.params.raw_date_cols else []
 drop_cols = {ID_COL}
 if label_col is not None:
@@ -166,16 +147,12 @@ X_clin = numeric_only(X_clin)
 if X_clin.shape[1] == 0:
     X_clin = pd.DataFrame({"clin_const": np.zeros(len(clinic_c), dtype=float)})
 
-# -----------------------
 # Radiomics feature matrices
-# -----------------------
 X_A = features_only(A_c, "A_features")
 X_B = features_only(B_c, "B_features")
 X_D = features_only(D_c, "delta_features")
 
-# -----------------------
 # Build scenarios
-# -----------------------
 datasets = {
     "clinical": X_clin,
     "clinA": pd.concat([X_clin, X_A], axis=1),
@@ -183,9 +160,7 @@ datasets = {
     "clinD": pd.concat([X_clin, X_D], axis=1),
 }
 
-# -----------------------
 # Outputs (explicit files)
-# -----------------------
 outputs = {
     "clinical": snakemake.output.clinical,
     "clinA": snakemake.output.clinA,
