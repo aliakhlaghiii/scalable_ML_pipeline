@@ -1,3 +1,3 @@
 paths:
-  data_folder: "/Users/ali/Downloads/modelling/modelling_data"
-  clinical_data: "/Users/ali/Desktop/lessons/integromics/modelling/clinical_data/10162025_UMCG_wide_export_Yescarta_infused_for_tFL_study.xlsx"
+  data_folder: "resources/modelling_data"
+  clinical_data: "resources/clinical/10162025_UMCG_wide_export_Yescarta_infused_for_tFL_study.xlsx"
