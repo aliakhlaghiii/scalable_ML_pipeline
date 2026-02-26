@@ -1,6 +1,6 @@
 paths:
-  data_folder: "resources/modelling_data"
-  clinical_data: "resources/clinical/yourfile.xlsx"
+  data_folder: "/Users/ali/Desktop/lessons/integromics/modelling/modelling_data"
+  clinical_data: "/Users/ali/Desktop/lessons/multivariate/exam2/clinical_trajectories_df.xlsx"
 
 ml:
   test_size: 0.2
@@ -11,8 +11,4 @@ clinical:
     - "surv_status"
     - "surv_status.factor"
     - "surv_status_factor"
-  raw_date_cols:
-    - "ae_summ_icans_start_v2"
-    - "ae_summ_icans_stop_v2"
-    - "surv_prog_date"
-    - "surv_death_date"
+  raw_date_cols: []
