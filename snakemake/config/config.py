@@ -1,76 +1,42 @@
 """
-config.py
+config/config.py
 
-Minimal YAML config loader for this project.
+Reproducible YAML config loader.
 
-- Loads config.yaml
+- Loads config/config.yaml (or a given path)
 - Validates required keys
-- Ensures paths exist
+- Resolves relative paths relative to project root
 """
 
-import os
+from __future__ import annotations
+
+from pathlib import Path
 import yaml
 
 
-def load_yaml_config(config_path="config.yaml"):
+def _project_root_from_config_path(config_path: Path) -> Path:
     """
-    Load a YAML configuration file and return it as a dict.
-
-    Parameters
-    ----------
-    config_path : str
-        Path to the YAML file.
-
-    Returns
-    -------
-    dict
-        Parsed YAML content.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the YAML file does not exist.
-    ValueError
-        If YAML content is empty or not a mapping.
+    Given .../config/config.yaml, return the project root (parent of config/).
     """
-    if not os.path.exists(config_path):
-        raise FileNotFoundError("Config file not found: {}".format(config_path))
+    return config_path.resolve().parent.parent
 
-    with open(config_path, "r") as f:
+
+def load_yaml_config(config_path: str | Path = "config/config.yaml") -> dict:
+    config_path = Path(config_path)
+
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    with config_path.open("r") as f:
         cfg = yaml.safe_load(f)
 
-    if cfg is None:
-        raise ValueError("Config is empty: {}".format(config_path))
-
     if not isinstance(cfg, dict):
-        raise ValueError("Config root must be a YAML mapping (dict).")
+        raise ValueError("Config YAML must be a mapping (dict) at top-level.")
 
     return cfg
 
 
-def get_paths(cfg):
-    """
-    Extract and validate the 'paths' section from the loaded config.
-
-    Parameters
-    ----------
-    cfg : dict
-        Parsed configuration.
-
-    Returns
-    -------
-    tuple
-        (data_folder, clinical_data) as strings.
-
-    Raises
-    ------
-    KeyError
-        If required keys are missing.
-    ValueError
-        If values are invalid types/empty.
-    FileNotFoundError
-        If configured paths do not exist.
-    """
+def get_paths(cfg: dict, config_path: str | Path = "config/config.yaml"):
     if "paths" not in cfg:
         raise KeyError("Missing required config section: paths")
 
@@ -78,42 +44,31 @@ def get_paths(cfg):
     if not isinstance(paths, dict):
         raise ValueError("Config key 'paths' must be a mapping (dict).")
 
-    if "data_folder" not in paths:
-        raise KeyError("Missing required config key: paths.data_folder")
-    if "clinical_data" not in paths:
-        raise KeyError("Missing required config key: paths.clinical_data")
+    for k in ("data_folder", "clinical_data"):
+        if k not in paths or not isinstance(paths[k], str) or not paths[k].strip():
+            raise KeyError(f"Missing or invalid required config key: paths.{k}")
 
-    data_folder = paths["data_folder"]
-    clinical_data = paths["clinical_data"]
+    config_path = Path(config_path)
+    project_root = _project_root_from_config_path(config_path)
 
-    if not isinstance(data_folder, str) or not data_folder.strip():
-        raise ValueError("paths.data_folder must be a non-empty string.")
-    if not isinstance(clinical_data, str) or not clinical_data.strip():
-        raise ValueError("paths.clinical_data must be a non-empty string.")
+    def resolve(p: str) -> Path:
+        pp = Path(p).expanduser()
+        if pp.is_absolute():
+            return pp
+        return (project_root / pp).resolve()
 
-    # These checks prevent silent errors later (monkey-proof).
-    if not os.path.isdir(data_folder):
-        raise FileNotFoundError("paths.data_folder is not a directory: {}".format(data_folder))
+    data_folder = resolve(paths["data_folder"])
+    clinical_data = resolve(paths["clinical_data"])
 
-    if not os.path.isfile(clinical_data):
-        raise FileNotFoundError("paths.clinical_data is not a file: {}".format(clinical_data))
+    if not data_folder.is_dir():
+        raise FileNotFoundError(f"paths.data_folder is not a directory: {data_folder}")
 
-    return data_folder, clinical_data
+    if not clinical_data.is_file():
+        raise FileNotFoundError(f"paths.clinical_data is not a file: {clinical_data}")
+
+    return str(data_folder), str(clinical_data)
 
 
-def load_paths(config_path="config.yaml"):
-    """
-    Convenience wrapper: load config.yaml and return validated paths.
-
-    Parameters
-    ----------
-    config_path : str
-        Path to YAML config.
-
-    Returns
-    -------
-    tuple
-        (data_folder, clinical_data) as strings.
-    """
+def load_paths(config_path: str | Path = "config/config.yaml"):
     cfg = load_yaml_config(config_path)
-    return get_paths(cfg)
+    return get_paths(cfg, config_path=config_path)
