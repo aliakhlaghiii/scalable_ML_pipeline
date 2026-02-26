@@ -1,3 +1,18 @@
 paths:
   data_folder: "resources/modelling_data"
-  clinical_data: "resources/clinical/10162025_UMCG_wide_export_Yescarta_infused_for_tFL_study.xlsx"
+  clinical_data: "resources/clinical/yourfile.xlsx"
+
+ml:
+  test_size: 0.2
+  random_state: 42
+
+clinical:
+  label_candidates:
+    - "surv_status"
+    - "surv_status.factor"
+    - "surv_status_factor"
+  raw_date_cols:
+    - "ae_summ_icans_start_v2"
+    - "ae_summ_icans_stop_v2"
+    - "surv_prog_date"
+    - "surv_death_date"
