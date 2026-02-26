@@ -19,7 +19,6 @@ from models import (
     make_svm_pipeline,
 )
 
-# Load train/test data (must contain a 'target' column)
 train_df = pd.read_csv(snakemake.input.train)
 test_df = pd.read_csv(snakemake.input.test)
 
@@ -32,15 +31,13 @@ y_train = train_df["target"]
 X_test = test_df.drop(columns=["target"])
 y_test = test_df["target"]
 
-# One scenario (keeps the models.py API, but matches professor-style script usage)
 X_splits = {"main": (X_train, X_test)}
 
 inner_cv = make_inner_cv(n_splits=5, random_state=42)
 param_grid = default_svm_param_grid()
 
-threads = getattr(snakemake, "threads", 1)
-if threads is None or threads < 1:
-    threads = 1
+threads = getattr(snakemake, "threads", 1) or 1
+threads = int(threads) if int(threads) > 0 else 1
 
 results, fitted_models = fit_gridsearch_and_evaluate(
     X_splits=X_splits,
@@ -50,20 +47,17 @@ results, fitted_models = fit_gridsearch_and_evaluate(
     param_grid=param_grid,
     inner_cv=inner_cv,
     scoring="roc_auc",
-    n_jobs=threads,
+    n_jobs=threads, 
     verbose=True,
 )
 
 best_model = fitted_models["main"]
 metrics = results["main"]
 
-# Ensure output directories exist
 Path(snakemake.output.model).parent.mkdir(parents=True, exist_ok=True)
 Path(snakemake.output.metrics).parent.mkdir(parents=True, exist_ok=True)
 
-# Save model
 joblib.dump(best_model, snakemake.output.model)
 
-# Save metrics (JSON)
 with open(snakemake.output.metrics, "w") as f:
     json.dump(metrics, f, indent=2, default=str)
