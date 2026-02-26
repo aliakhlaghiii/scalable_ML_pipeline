@@ -4,6 +4,10 @@ models.py
 Model pipelines and training utilities for SVM and Random Forest with GridSearchCV.
 """
 
+from __future__ import annotations
+
+from typing import Callable, Dict, Tuple, Any
+
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -20,56 +24,21 @@ from sklearn.metrics import (
 )
 
 
-def make_svm_pipeline(random_state=42):
-    """
-    Create an SVM (RBF) pipeline with median imputation and standard scaling.
+def make_inner_cv(n_splits: int = 5, random_state: int = 42) -> StratifiedKFold:
+    return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-    Parameters
-    ----------
-    random_state : int
-        Random seed used by SVC (only affects probability calibration internals).
 
-    Returns
-    -------
-    sklearn.pipeline.Pipeline
-        Pipeline: imputer -> scaler -> SVC
-    """
+def make_svm_pipeline(random_state: int = 42) -> Pipeline:
     return Pipeline(
         [
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            (
-                "svm",
-                SVC(
-                    kernel="rbf",
-                    class_weight="balanced",
-                    probability=True,
-                    random_state=random_state,
-                ),
-            ),
+            ("svm", SVC(kernel="rbf", probability=True, class_weight="balanced", random_state=random_state)),
         ]
     )
 
 
-def make_rf_pipeline(random_state=42):
-    """
-    Create a Random Forest pipeline with median imputation and standard scaling.
-
-    Note
-    ----
-    StandardScaler is not required for tree models, but you already used it in the notebook.
-    Keeping it here preserves behavior and keeps pipelines consistent.
-
-    Parameters
-    ----------
-    random_state : int
-        Random seed for the forest.
-
-    Returns
-    -------
-    sklearn.pipeline.Pipeline
-        Pipeline: imputer -> scaler -> RandomForestClassifier
-    """
+def make_rf_pipeline(random_state: int = 42) -> Pipeline:
     return Pipeline(
         [
             ("imputer", SimpleImputer(strategy="median")),
@@ -86,65 +55,33 @@ def make_rf_pipeline(random_state=42):
     )
 
 
-def default_svm_param_grid():
-    """
-    Default hyperparameter grid for the SVM pipeline.
-
-    Returns
-    -------
-    dict
-        Grid for GridSearchCV.
-    """
+def default_svm_param_grid() -> Dict[str, Any]:
     return {
         "svm__C": [0.1, 1, 10],
         "svm__gamma": ["scale", 0.01, 0.1],
+        "svm__kernel": ["rbf"],
     }
 
 
-def default_rf_param_grid():
-    """
-    Default hyperparameter grid for the Random Forest pipeline.
-
-    Returns
-    -------
-    dict
-        Grid for GridSearchCV.
-    """
+def default_rf_param_grid() -> Dict[str, Any]:
     return {
-        "rf__max_depth": [2, 3],
-        "rf__min_samples_leaf": [2, 4],
-        "rf__max_features": ["sqrt", 0.5],
+        "rf__max_depth": [None, 5, 10],
+        "rf__min_samples_split": [2, 5, 10],
+        "rf__min_samples_leaf": [1, 2, 4],
+        "rf__max_features": ["sqrt", "log2"],
     }
-
-
-def make_inner_cv(n_splits=5, random_state=42):
-    """
-    Create StratifiedKFold for inner cross-validation.
-
-    Parameters
-    ----------
-    n_splits : int
-        Number of CV folds.
-    random_state : int
-        Seed for shuffling.
-
-    Returns
-    -------
-    sklearn.model_selection.StratifiedKFold
-        StratifiedKFold instance.
-    """
-    return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
 
 def fit_gridsearch_and_evaluate(
-    X_splits,
+    X_splits: Dict[str, Tuple[Any, Any]],
     y_train,
     y_test,
-    make_pipeline_func,
-    param_grid,
+    make_pipeline_func: Callable[[], Pipeline],
+    param_grid: Dict[str, Any],
     inner_cv,
-    scoring="roc_auc",
-    verbose=True,
+    scoring: str = "roc_auc",
+    n_jobs: int = 1,
+    verbose: bool = True,
 ):
     """
     Fit GridSearchCV for each scenario in X_splits and evaluate on the test split.
@@ -152,30 +89,31 @@ def fit_gridsearch_and_evaluate(
     Parameters
     ----------
     X_splits : dict
-        Mapping: scenario_name -> (X_train, X_test)
-    y_train : array-like
-        Training labels aligned with X_train for each scenario.
-    y_test : array-like
-        Test labels aligned with X_test for each scenario.
-    make_pipeline_func : callable
-        Function that returns a fresh sklearn Pipeline (e.g., make_svm_pipeline).
-    param_grid : dict
-        GridSearchCV parameter grid (pipeline-style keys like 'svm__C').
-    inner_cv : sklearn CV splitter
-        Inner CV strategy (e.g., StratifiedKFold).
-    scoring : str
-        GridSearchCV scoring metric (default: 'roc_auc').
-    verbose : bool
-        If True, prints a summary per scenario.
+        scenario_name -> (X_train, X_test)
+    y_train, y_test :
+        labels for train/test
+    make_pipeline_func :
+        function returning a fresh sklearn Pipeline
+    param_grid :
+        GridSearchCV parameter grid
+    inner_cv :
+        CV splitter
+    scoring :
+        scoring metric for GridSearchCV
+    n_jobs :
+        parallelism inside GridSearchCV
+    verbose :
+        print progress
 
     Returns
     -------
-    (dict, dict)
-        results: scenario_name -> metrics dict
-        fitted_models: scenario_name -> best_estimator (Pipeline)
+    (results, fitted_models)
     """
-    results = {}
-    fitted_models = {}
+    if n_jobs is None or int(n_jobs) < 1:
+        n_jobs = 1
+
+    results: Dict[str, Dict[str, Any]] = {}
+    fitted_models: Dict[str, Pipeline] = {}
 
     for name, (X_train, X_test) in X_splits.items():
         if verbose:
@@ -189,18 +127,15 @@ def fit_gridsearch_and_evaluate(
             cv=inner_cv,
             scoring=scoring,
             refit=True,
+            n_jobs=n_jobs,  # ✅ THIS is the real parallelization inside GridSearchCV
         )
-        # sanity check to prevent silent label-feature misalignment
-        if len(X_train) != len(y_train):
-            raise ValueError(
-                f"[{name}] X_train and y_train length mismatch: {len(X_train)} vs {len(y_train)}"
-            )
-        if len(X_test) != len(y_test):
-            raise ValueError(
-                f"[{name}] X_test and y_test length mismatch: {len(X_test)} vs {len(y_test)}"
-            )
 
-        # If pandas objects, also enforce index alignment
+        # sanity checks to prevent silent label-feature misalignment
+        if len(X_train) != len(y_train):
+            raise ValueError(f"[{name}] X_train and y_train length mismatch: {len(X_train)} vs {len(y_train)}")
+        if len(X_test) != len(y_test):
+            raise ValueError(f"[{name}] X_test and y_test length mismatch: {len(X_test)} vs {len(y_test)}")
+
         if hasattr(X_train, "index") and hasattr(y_train, "index"):
             if not X_train.index.equals(y_train.index):
                 raise ValueError(f"[{name}] X_train and y_train indices are not aligned.")
@@ -209,23 +144,21 @@ def fit_gridsearch_and_evaluate(
                 raise ValueError(f"[{name}] X_test and y_test indices are not aligned.")
 
         grid.fit(X_train, y_train)
-        best_clf = grid.best_estimator_
 
+        best_clf: Pipeline = grid.best_estimator_
         y_pred = best_clf.predict(X_test)
-
-        # Some classifiers might not support predict_proba; your SVM/RF do, so this is safe here.
         y_proba = best_clf.predict_proba(X_test)[:, 1]
 
         cm = confusion_matrix(y_test, y_pred)
 
         res = {
             "best_params": grid.best_params_,
-            "cv_best_score": grid.best_score_,
-            "accuracy": accuracy_score(y_test, y_pred),
-            "balanced_accuracy": balanced_accuracy_score(y_test, y_pred),
-            "f1": f1_score(y_test, y_pred, zero_division=0),
-            "roc_auc": roc_auc_score(y_test, y_proba),
-            "confusion_matrix": cm,
+            "cv_best_score": float(grid.best_score_),
+            "accuracy": float(accuracy_score(y_test, y_pred)),
+            "balanced_accuracy": float(balanced_accuracy_score(y_test, y_pred)),
+            "f1": float(f1_score(y_test, y_pred, zero_division=0)),
+            "roc_auc": float(roc_auc_score(y_test, y_proba)),
+            "confusion_matrix": cm.tolist(),
             "report": classification_report(y_test, y_pred, zero_division=0),
         }
 
@@ -239,10 +172,7 @@ def fit_gridsearch_and_evaluate(
             print("CV best {}: {:.3f}".format(scoring, res["cv_best_score"]))
             print(
                 "Test Acc: {:.3f} | BalAcc: {:.3f} | F1: {:.3f} | Test ROC-AUC: {:.3f}".format(
-                    res["accuracy"],
-                    res["balanced_accuracy"],
-                    res["f1"],
-                    res["roc_auc"],
+                    res["accuracy"], res["balanced_accuracy"], res["f1"], res["roc_auc"]
                 )
             )
             print("Confusion matrix [[TN FP],[FN TP]]:")
