@@ -127,7 +127,7 @@ def fit_gridsearch_and_evaluate(
             cv=inner_cv,
             scoring=scoring,
             refit=True,
-            n_jobs=n_jobs,  # this is the real parallelization inside GridSearchCV
+            n_jobs=n_jobs,
         )
 
         # sanity checks to prevent silent label-feature misalignment
