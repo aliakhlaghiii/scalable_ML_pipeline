@@ -91,7 +91,6 @@ def get_paths(cfg):
     if not isinstance(clinical_data, str) or not clinical_data.strip():
         raise ValueError("paths.clinical_data must be a non-empty string.")
 
-    # These checks prevent silent errors later (monkey-proof).
     if not os.path.isdir(data_folder):
         raise FileNotFoundError("paths.data_folder is not a directory: {}".format(data_folder))
 
