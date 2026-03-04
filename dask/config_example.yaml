@@ -1,0 +1,3 @@
+paths:
+  data_folder: "/path/to/modelling_data"
+  clinical_data: "/path/to/clinical.xlsx"
