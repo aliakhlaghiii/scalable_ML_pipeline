@@ -1,4 +1,3 @@
-# train_xgboost_dask.py
 """
 train_xgboost_dask.py
 
@@ -24,12 +23,15 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
 import numpy as np
 import pandas as pd
 import dask.dataframe as dd
 from dask.distributed import Client, LocalCluster
+
 import xgboost as xgb
 from xgboost import dask as dxgb
+
 from sklearn.metrics import (
     accuracy_score,
     precision_recall_fscore_support,
@@ -52,6 +54,31 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def make_unique_columns(cols: List[str]) -> List[str]:
+    """Make column names unique by appending '__dupN' suffixes."""
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for c in cols:
+        c0 = str(c)
+        if c0 not in seen:
+            seen[c0] = 0
+            out.append(c0)
+        else:
+            seen[c0] += 1
+            out.append(f"{c0}__dup{seen[c0]}")
+    return out
+
+
+def ensure_unique_ddf_columns(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Ensure Dask DataFrame has unique column names."""
+    cols = list(map(str, ddf.columns))
+    if len(cols) == len(set(cols)):
+        return ddf
+    ddf = ddf.copy()
+    ddf.columns = make_unique_columns(cols)
+    return ddf
+
+
 def feature_cols(cols: List[str], target_col: str, id_col: str) -> List[str]:
     """Return feature columns excluding target and id."""
     return [c for c in cols if c not in (target_col, id_col)]
@@ -59,15 +86,12 @@ def feature_cols(cols: List[str], target_col: str, id_col: str) -> List[str]:
 
 def prf_scores(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     """Compute precision, recall and F1 scores (macro and weighted)."""
-
     p_m, r_m, f_m, _ = precision_recall_fscore_support(
         y_true, y_pred, average="macro", zero_division=0
     )
-
     p_w, r_w, f_w, _ = precision_recall_fscore_support(
         y_true, y_pred, average="weighted", zero_division=0
     )
-
     return {
         "precision_macro": float(p_m),
         "recall_macro": float(r_m),
@@ -102,7 +126,6 @@ def auc_multiclass_ovr(
         aucs: List[float] = []
         for k in range(int(n_classes)):
             yk = (y_true == k).astype(int)
-            # if class absent or all present -> undefined AUC; skip
             if yk.sum() == 0 or yk.sum() == len(yk):
                 continue
             try:
@@ -122,27 +145,33 @@ def main() -> None:
     cluster = LocalCluster(
         n_workers=int(args.n_workers),
         threads_per_worker=int(args.threads_per_worker),
-        processes=True,
+        processes=False,
         dashboard_address=None,
     )
     client = Client(cluster)
 
-    # Load datasets
     dtrain = dd.read_parquet(args.train)
     dtest = dd.read_parquet(args.test)
+
+    dtrain = ensure_unique_ddf_columns(dtrain)
+    dtest = ensure_unique_ddf_columns(dtest)
 
     if args.target_col not in dtrain.columns:
         raise SystemExit(f"Target column not found in train: {args.target_col}")
 
     feats = feature_cols(list(dtrain.columns), target_col=args.target_col, id_col=args.id_col)
+    feats = list(dict.fromkeys(feats))
 
-    X_train = dtrain[feats].to_dask_array(lengths=True)
-    y_train = dtrain[args.target_col].to_dask_array(lengths=True)
+    train_arr = dtrain[feats + [args.target_col]].to_dask_array(lengths=True)
+    X_train = train_arr[:, :-1].astype(np.float32)
+    y_train = train_arr[:, -1].astype(np.int64)
 
-    X_test = dtest[feats].to_dask_array(lengths=True)
-    y_test = dtest[args.target_col].to_dask_array(lengths=True)
+    test_arr = dtest[feats + [args.target_col]].to_dask_array(lengths=True)
+    X_test = test_arr[:, :-1].astype(np.float32)
+    y_test = test_arr[:, -1].astype(np.int64)
 
-    # Model params: keep defaults except required multiclass + seed
+    X_train, y_train, X_test, y_test = client.persist([X_train, y_train, X_test, y_test])
+
     n_classes = int(dtrain[args.target_col].nunique().compute())
     params = {
         "objective": "multi:softprob",
@@ -153,38 +182,26 @@ def main() -> None:
 
     dtrain_mat = dxgb.DaskDMatrix(client, X_train, y_train)
 
-    # Training
     t0 = time.perf_counter()
-
     out = dxgb.train(
         client,
         params,
         dtrain_mat,
-        num_boost_round=args.num_round,
+        num_boost_round=int(args.num_round),
     )
-
     train_seconds = time.perf_counter() - t0
 
     booster: xgb.Booster = out["booster"]
 
-    # Inference
     t1 = time.perf_counter()
-
     dtest_mat = dxgb.DaskDMatrix(client, X_test)
-
-    proba_d = dxgb.predict(
-        client,
-        booster,
-        dtest_mat,
-    )  # returns Dask array
-
-    proba = proba_d.compute()  # collect predictions locally
+    proba_d = dxgb.predict(client, booster, dtest_mat)
+    proba = proba_d.compute()
     infer_seconds = time.perf_counter() - t1
 
     y_true = y_test.compute()
     y_pred = proba.argmax(axis=1)
 
-    # Metrics
     metrics: Dict[str, Any] = {
         "n_classes": int(n_classes),
         "n_train": int(dtrain.shape[0].compute()),
@@ -195,17 +212,14 @@ def main() -> None:
         **auc_multiclass_ovr(y_true, proba, n_classes),
     }
 
-    # Save model
     model_path = outdir / "model.json"
     booster.save_model(model_path.as_posix())
 
-    # Save metrics
     (outdir / "metrics.json").write_text(
         json.dumps(metrics, indent=2),
         encoding="utf-8",
     )
 
-    # Save benchmark info
     bench = {
         "workflow": "dask_xgboost",
         "train_seconds": float(train_seconds),
@@ -217,27 +231,11 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    # Save predictions
-    test_pdf = (
-        dtest[[args.id_col]].compute()
-        if args.id_col in dtest.columns
-        else None
-    )
+    test_pdf = dtest[[args.id_col]].compute() if args.id_col in dtest.columns else None
 
-    pred_df = pd.DataFrame(
-        {
-            "y_true": y_true,
-            "y_pred": y_pred,
-        }
-    )
-
-    # include patient id if available
+    pred_df = pd.DataFrame({"y_true": y_true, "y_pred": y_pred})
     if test_pdf is not None:
-        pred_df.insert(
-            0,
-            "id",
-            test_pdf[args.id_col].astype(str).to_numpy(),
-        )
+        pred_df.insert(0, "id", test_pdf[args.id_col].astype(str).to_numpy())
 
     pred_df.to_csv(outdir / "predictions_test.csv", index=False)
 
