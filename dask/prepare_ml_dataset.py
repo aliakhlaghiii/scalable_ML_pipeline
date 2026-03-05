@@ -1,4 +1,3 @@
-# prepare_ml_dataset.py
 """
 prepare_ml_dataset.py
 
@@ -26,6 +25,7 @@ import numpy as np
 import pandas as pd
 import dask.dataframe as dd
 
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for dataset preparation."""
     p = argparse.ArgumentParser()
@@ -38,13 +38,48 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def make_unique_columns(cols: List[str]) -> List[str]:
+    """
+    Make column names unique by appending '__dupN' suffixes.
+
+    Parameters
+    ----------
+    cols : list[str]
+        Original column names.
+
+    Returns
+    -------
+    list[str]
+        Unique column names in the same order.
+    """
+    seen: Dict[str, int] = {}
+    out: List[str] = []
+    for c in cols:
+        c0 = str(c)
+        if c0 not in seen:
+            seen[c0] = 0
+            out.append(c0)
+        else:
+            seen[c0] += 1
+            out.append(f"{c0}__dup{seen[c0]}")
+    return out
+
+
+def ensure_unique_ddf_columns(ddf: dd.DataFrame) -> dd.DataFrame:
+    """Ensure Dask DataFrame has unique column names."""
+    cols = list(map(str, ddf.columns))
+    if len(cols) == len(set(cols)):
+        return ddf
+    ddf = ddf.copy()
+    ddf.columns = make_unique_columns(cols)
+    return ddf
+
+
 # Target encoding
 def encode_target(ddf: dd.DataFrame, target_col: str) -> Tuple[dd.DataFrame, Dict[str, int]]:
     """Encode a categorical target column to integer labels."""
-    # compute unique values (drops NaN)
     uniq = ddf[target_col].dropna().unique().compute().tolist()
     uniq = sorted([str(u) for u in uniq])
-
     mapping = {u: i for i, u in enumerate(uniq)}
 
     def _encode(pdf: pd.DataFrame) -> pd.DataFrame:
@@ -61,6 +96,7 @@ def encode_target(ddf: dd.DataFrame, target_col: str) -> Tuple[dd.DataFrame, Dic
 # Leakage removal
 _LEAK_PAT = re.compile(r"^(surv_|post_cart_)", flags=re.IGNORECASE)
 
+
 def leak_columns(cols: List[str], target_col: str) -> List[str]:
     """Detect columns that could leak label information (heuristic)."""
     leak = []
@@ -69,7 +105,6 @@ def leak_columns(cols: List[str], target_col: str) -> List[str]:
             continue
         if _LEAK_PAT.search(str(c)):
             leak.append(c)
-    # also drop any near-duplicates of target col
     for c in ("bestresponse", "response", "survival"):
         if c in cols and c not in leak:
             leak.append(c)
@@ -81,34 +116,6 @@ def build_mapping_for_series(s: dd.Series) -> Dict[str, int]:
     uniq = s.dropna().astype(str).unique().compute().tolist()
     uniq = sorted(uniq)
     return {v: i for i, v in enumerate(uniq)}
-
-
-def encode_object_features(ddf: dd.DataFrame, exclude: List[str]) -> dd.DataFrame:
-    """Encode object/string columns to numeric codes (float64) via per-column mapping."""
-    obj_cols = [
-        c for c, dt in ddf.dtypes.items()
-        if str(dt) in ("object", "string") and c not in exclude
-    ]
-    if not obj_cols:
-        return ddf
-
-    mappings: Dict[str, Dict[str, int]] = {}
-    for c in obj_cols:
-        mappings[c] = build_mapping_for_series(ddf[c])  # compute uniques once per col
-
-    def _encode(pdf: pd.DataFrame) -> pd.DataFrame:
-        """Partition-level object encoding; unmapped values become NaN."""
-        pdf = pdf.copy()
-        for c in obj_cols:
-            # Using float64 so NaN is representable (int dtype can't hold NaN).
-            pdf[c] = pdf[c].astype(str).map(mappings[c]).astype("float64")
-        return pdf
-
-    meta = ddf._meta.copy()
-    for c in obj_cols:
-        meta[c] = pd.Series(dtype="float64")  # required for Dask type inference stability
-
-    return ddf.map_partitions(_encode, meta=meta)
 
 
 def encode_object_features_train_test(
@@ -126,7 +133,7 @@ def encode_object_features_train_test(
 
     mappings: Dict[str, Dict[str, int]] = {}
     for c in obj_cols:
-        mappings[c] = build_mapping_for_series(train[c])  # compute uniques on TRAIN only
+        mappings[c] = build_mapping_for_series(train[c])
 
     def _encode_with_map(pdf: pd.DataFrame) -> pd.DataFrame:
         """Partition-level object encoding; unmapped values become NaN."""
@@ -157,14 +164,12 @@ def coerce_numeric_features(ddf: dd.DataFrame, cols: List[str]) -> dd.DataFrame:
 
     meta = ddf._meta.copy()
     for c in cols:
-        meta[c] = pd.Series(dtype="float64")  # tells Dask the output dtype
-
+        meta[c] = pd.Series(dtype="float64")
     return ddf.map_partitions(_coerce, meta=meta)
 
 
 def drop_all_nan_columns(ddf: dd.DataFrame, cols: List[str]) -> List[str]:
     """Return subset of cols that have at least one non-null value in the full dataset."""
-    # This computes a boolean mask across the cluster (can be expensive for huge wide tables).
     nonnull_any = (~ddf[cols].isna()).any().compute()
     return nonnull_any[nonnull_any].index.tolist()
 
@@ -172,8 +177,7 @@ def drop_all_nan_columns(ddf: dd.DataFrame, cols: List[str]) -> List[str]:
 def zscore_fit_stats(train: dd.DataFrame, cols: List[str]) -> Tuple[pd.Series, pd.Series]:
     """Compute mean/std on TRAIN only for z-score scaling."""
     mu = train[cols].mean().compute()
-    # ddof=0 => population std; avoids tiny-sample behavior differences vs ddof=1
-    sd = train[cols].std(ddof=0).compute().replace(0.0, np.nan)  # prevent divide-by-zero
+    sd = train[cols].std(ddof=0).compute().replace(0.0, np.nan)
     return mu, sd
 
 
@@ -185,10 +189,8 @@ def zscore_apply(ddf: dd.DataFrame, cols: List[str], mu: pd.Series, sd: pd.Serie
         for c in cols:
             m = float(mu[c])
             s = float(sd[c]) if pd.notna(sd[c]) else np.nan
-            # fill missing with train mean so scaling doesn't inject NaNs downstream
             x = pd.to_numeric(pdf[c], errors="coerce").fillna(m)
             if not np.isfinite(s) or s == 0.0:
-                # If feature has zero variance on train, it carries no signal -> set to 0
                 pdf[c] = 0.0
             else:
                 pdf[c] = (x - m) / s
@@ -196,8 +198,7 @@ def zscore_apply(ddf: dd.DataFrame, cols: List[str], mu: pd.Series, sd: pd.Serie
 
     meta = ddf._meta.copy()
     for c in cols:
-        meta[c] = pd.Series(dtype="float64")  # ensure stable output schema
-
+        meta[c] = pd.Series(dtype="float64")
     return ddf.map_partitions(_apply, meta=meta)
 
 
@@ -208,61 +209,59 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     ddf = dd.read_parquet(args.data)
+    ddf = ensure_unique_ddf_columns(ddf)
 
     if args.target_col not in ddf.columns:
         raise SystemExit(f"Target column not found: {args.target_col}")
 
-    # drop NA target rows (can't train supervised model without labels)
     ddf = ddf.dropna(subset=[args.target_col])
 
-    # encode target
     ddf, target_mapping = encode_target(ddf, args.target_col)
 
-    # drop leakage columns
     cols_all = list(ddf.columns)
     leaks = leak_columns(cols_all, target_col=args.target_col)
     if leaks:
         ddf = ddf.drop(columns=leaks, errors="ignore")
 
-    # build feature set
+    ddf = ensure_unique_ddf_columns(ddf)
+
     id_present = args.id_col in ddf.columns
+
     exclude_for_features = {args.target_col, "target"}
     feature_cols = [c for c in ddf.columns if c not in exclude_for_features]
+    if id_present:
+        feature_cols = [c for c in feature_cols if c != args.id_col]
 
-    # restrict to the columns we actually need downstream
     base_cols = ([args.id_col] if id_present else []) + feature_cols + ["target"]
     ddf_base = ddf[base_cols]
+    ddf_base = ensure_unique_ddf_columns(ddf_base)
 
-    # split with Dask (random_split is approximate by partition; good enough for most ML baselines)
     train_frac = 1.0 - float(args.test_frac)
     train_ddf, test_ddf = ddf_base.random_split([train_frac, float(args.test_frac)], random_state=args.seed)
 
-    # encode object/string features -> numeric codes (as float64), fitted on TRAIN only
     train_ddf, test_ddf = encode_object_features_train_test(
         train_ddf,
         test_ddf,
         exclude=[args.id_col] if id_present else [],
     )
 
-    # coerce all features (except id) to float64 (kills 'NE' etc.)
     scale_candidates = [c for c in feature_cols if (not id_present or c != args.id_col)]
     train_ddf = coerce_numeric_features(train_ddf, scale_candidates)
     test_ddf = coerce_numeric_features(test_ddf, scale_candidates)
 
-    # drop features that are all-NaN (decide on TRAIN only, then apply to both)
     kept_scale = drop_all_nan_columns(train_ddf, scale_candidates)
     final_feature_cols = ([args.id_col] if id_present else []) + kept_scale
 
-    # final tables: features + target
     train_final = train_ddf[final_feature_cols + ["target"]]
     test_final = test_ddf[final_feature_cols + ["target"]]
 
-    # z-score scaling (fit on TRAIN only)
+    train_final = ensure_unique_ddf_columns(train_final)
+    test_final = ensure_unique_ddf_columns(test_final)
+
     mu, sd = zscore_fit_stats(train_final, kept_scale)
     train_final = zscore_apply(train_final, kept_scale, mu, sd)
     test_final = zscore_apply(test_final, kept_scale, mu, sd)
 
-    # write artifacts
     train_path = outdir / "train.parquet"
     test_path = outdir / "test.parquet"
 
