@@ -1,3 +1,4 @@
+# eda_delayed.py
 """eda_delayed.py
 
 Task 3: Exploratory Data Analysis with Dask
@@ -15,10 +16,11 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import pandas as pd
 import numpy as np
 import dask.dataframe as dd
+from dask import delayed
 
 # CLI
 def parse_args() -> argparse.Namespace:
@@ -38,92 +40,58 @@ def parse_args() -> argparse.Namespace:
 
 # Utils
 def _timer(fn, *args, **kwargs):
-    """Run a function and return (output, elapsed_seconds)."""
+    """Measure runtime in seconds for a callable (returns (result, seconds))."""
     t0 = time.perf_counter()
     out = fn(*args, **kwargs)
     t1 = time.perf_counter()
     return out, (t1 - t0)
 
 
-def _is_numeric_dtype(dtype) -> bool:
-    """Return True if a dtype should be treated as numeric for EDA."""
-    # NOTE: Dask dtypes are sometimes stringified; this keeps the check simple and stable.
-    s = str(dtype)
-    return s not in ("object", "string", "boolean")
+def pick_target_column(ddf: dd.DataFrame, preferred: str = "") -> str:
+    """Heuristic target column picker."""
+    if preferred and preferred in ddf.columns:
+        return preferred
 
+    # common candidate patterns
+    candidates = [
+        c
+        for c in ddf.columns
+        if any(k in str(c).lower() for k in ("target", "response", "surv_bestresponse"))
+    ]
 
-def _numeric_cols_ddf(ddf: dd.DataFrame, id_col: str = "id") -> List[str]:
-    """List numeric feature columns in a Dask DataFrame, excluding the ID column."""
-    return [c for c in ddf.columns if c != id_col and _is_numeric_dtype(ddf[c].dtype)]
+    return candidates[0] if candidates else ""
 
 
 def _numeric_cols_pdf(pdf: pd.DataFrame, id_col: str = "id") -> List[str]:
-    """List numeric feature columns in a pandas DataFrame, excluding the ID column."""
-    return [c for c in pdf.columns if c != id_col and pd.api.types.is_numeric_dtype(pdf[c])]
+    """Select numeric columns in pandas, excluding ID."""
+    cols: List[str] = []
+    for c in pdf.columns:
+        if c == id_col:
+            continue
+        if pd.api.types.is_numeric_dtype(pdf[c]):
+            cols.append(c)
+    return cols
 
 
-def pick_target_column(ddf: dd.DataFrame, user_target: str) -> str:
-    """Pick a target column using user input, known candidates, or heuristics."""
-    if user_target and user_target in ddf.columns:
-        return user_target
-
-    # sensible defaults for your dataset (based on columns you already saw)
-    candidates = [
-        "surv_bestresponse_car.factor",
-        "surv_bestresponse_car",
-        "surv_prog_after_car.factor",
-        "surv_prog_after_car",
-        "surv_time_bestresponse_car",
-        "ae_summ_highestgrade_v2.factor",
-        "ae_summ_highestgrade_v2",
-    ]
-    for c in candidates:
-        if c in ddf.columns:
-            return c
-
-    # fallback: any column containing "surv_" and ".factor" first
-    cols = list(ddf.columns)
-    for c in cols:
-        if "surv_" in c and c.endswith(".factor"):
-            return c
-    for c in cols:
-        if "surv_" in c:
-            return c
-
-    return ""  # no target found
+def _numeric_cols_ddf(ddf: dd.DataFrame, id_col: str = "id") -> List[str]:
+    """Select numeric columns in Dask DataFrame, excluding ID."""
+    cols: List[str] = []
+    for c, dt in ddf.dtypes.items():
+        if c == id_col:
+            continue
+        if pd.api.types.is_numeric_dtype(dt):
+            cols.append(c)
+    return cols
 
 
 def plot_target_distribution(series: pd.Series, out_png: Path, title: str) -> None:
-    """Save a histogram (numeric) or bar chart (categorical) for the target series."""
+    """Plot and save the target variable distribution."""
     import matplotlib.pyplot as plt
 
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-
-    # Decide categorical vs numeric
-    if pd.api.types.is_numeric_dtype(series) and series.nunique(dropna=True) > 10:
-        # numeric target -> histogram
-        vals = pd.to_numeric(series, errors="coerce").dropna()
-        plt.figure()
-        plt.hist(vals.values, bins=20)
-        plt.title(title)
-        plt.xlabel("target value")
-        plt.ylabel("count")
-        plt.tight_layout()
-        plt.savefig(out_png)
-        plt.close()
-        return
-
-    # categorical target -> bar
-    counts = series.value_counts(dropna=False)
-    x = counts.index.astype(str)
-    y = counts.values
-
+    vc = series.value_counts(dropna=False)
     plt.figure()
-    plt.bar(x, y)
+    vc.plot(kind="bar")
     plt.title(title)
-    plt.xlabel("target class")
-    plt.ylabel("count")
-    plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     plt.savefig(out_png)
     plt.close()
@@ -134,24 +102,108 @@ def dask_eda(ddf: dd.DataFrame, topk: int, target_col: str) -> Dict[str, object]
     """Compute EDA artifacts using Dask (lazy ops + compute at the end)."""
     out: Dict[str, object] = {}
 
-    # ddf.shape[0] is lazy; compute() triggers the actual row count execution.
-    out["rows"] = int(ddf.shape[0].compute())
-    out["cols"] = int(len(ddf.columns))
-
-    missing = ddf.isna().mean().compute().sort_values(ascending=False)
-    out["missing"] = missing
-
     num_cols = _numeric_cols_ddf(ddf, id_col="id")
     out["n_numeric"] = int(len(num_cols))
 
-    # summary stats + median_approx
-    desc = ddf[num_cols].describe().compute()
-    med = ddf[num_cols].median_approximate().compute()
-    desc.loc["median_approx"] = med
-    out["summary"] = desc
+    parts = ddf.to_delayed()
 
-    var = ddf[num_cols].var().compute().sort_values(ascending=False).head(topk)
-    out["top_variance"] = var
+    def _row_and_missing(pdf: pd.DataFrame) -> Dict[str, object]:
+        """Partition-level row count and missing counts."""
+        n = int(len(pdf))
+        miss = pdf.isna().sum().to_dict()
+        return {"n": n, "miss": {k: int(v) for k, v in miss.items()}}
+
+    stats_parts = [delayed(_row_and_missing)(p) for p in parts]
+
+    def _agg_rows_and_missing(stats_list: List[Dict[str, object]], cols: List[str]) -> Tuple[int, pd.Series]:
+        """Aggregate missing counts into missing fractions."""
+        total_n = 0
+        miss_totals = {c: 0 for c in cols}
+        for d in stats_list:
+            total_n += int(d.get("n", 0))
+            miss = d.get("miss", {}) or {}
+            for c in cols:
+                miss_totals[c] += int(miss.get(c, 0))
+        if total_n <= 0:
+            return 0, pd.Series({c: 1.0 for c in cols})
+        return total_n, pd.Series({c: miss_totals[c] / float(total_n) for c in cols})
+
+    n_rows, missing_frac = delayed(_agg_rows_and_missing)(stats_parts, list(ddf.columns)).compute()
+    out["rows"] = int(n_rows)
+    out["cols"] = int(len(ddf.columns))
+    out["missing"] = missing_frac.sort_values(ascending=False)
+
+    if not num_cols:
+        out["summary"] = pd.DataFrame()
+        out["top_variance"] = pd.Series(dtype="float64")
+    else:
+        def _num_moments(pdf: pd.DataFrame, cols: List[str]) -> Dict[str, object]:
+            """Partition-level numeric moments for summary/variance."""
+            x = pdf[cols].apply(pd.to_numeric, errors="coerce")
+            cnt = x.count().to_dict()
+            s1 = x.sum().to_dict()
+            s2 = (x * x).sum().to_dict()
+            mn = x.min().to_dict()
+            mx = x.max().to_dict()
+            return {
+                "cnt": {k: int(v) for k, v in cnt.items()},
+                "s1": {k: float(v) if pd.notna(v) else 0.0 for k, v in s1.items()},
+                "s2": {k: float(v) if pd.notna(v) else 0.0 for k, v in s2.items()},
+                "min": {k: float(v) if pd.notna(v) else np.nan for k, v in mn.items()},
+                "max": {k: float(v) if pd.notna(v) else np.nan for k, v in mx.items()},
+            }
+
+        mom_parts = [delayed(_num_moments)(p, num_cols) for p in parts]
+
+        def _agg_moments(moms: List[Dict[str, object]], cols: List[str]) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
+            """Aggregate numeric moments across partitions."""
+            cnt = {c: 0 for c in cols}
+            s1 = {c: 0.0 for c in cols}
+            s2 = {c: 0.0 for c in cols}
+            mn = {c: np.nan for c in cols}
+            mx = {c: np.nan for c in cols}
+
+            for m in moms:
+                mc = m.get("cnt", {}) or {}
+                ms1 = m.get("s1", {}) or {}
+                ms2 = m.get("s2", {}) or {}
+                mmin = m.get("min", {}) or {}
+                mmax = m.get("max", {}) or {}
+
+                for c in cols:
+                    cnt[c] += int(mc.get(c, 0))
+                    s1[c] += float(ms1.get(c, 0.0))
+                    s2[c] += float(ms2.get(c, 0.0))
+                    vmin = mmin.get(c, np.nan)
+                    vmax = mmax.get(c, np.nan)
+                    mn[c] = np.nanmin([mn[c], vmin]) if (pd.notna(vmin) or pd.notna(mn[c])) else np.nan
+                    mx[c] = np.nanmax([mx[c], vmax]) if (pd.notna(vmax) or pd.notna(mx[c])) else np.nan
+
+            cnt_s = pd.Series(cnt, dtype="int64")
+            s1_s = pd.Series(s1, dtype="float64")
+            s2_s = pd.Series(s2, dtype="float64")
+            mn_s = pd.Series(mn, dtype="float64")
+            mx_s = pd.Series(mx, dtype="float64")
+            return cnt_s, s1_s, s2_s, mn_s, mx_s
+
+        cnt_s, s1_s, s2_s, mn_s, mx_s = delayed(_agg_moments)(mom_parts, num_cols).compute()
+        mean_s = s1_s / cnt_s.replace(0, np.nan)
+        var_s = (s2_s / cnt_s.replace(0, np.nan)) - (mean_s * mean_s)
+        var_s = var_s.clip(lower=0.0)
+        std_s = np.sqrt(var_s)
+
+        desc = pd.DataFrame(index=["count", "mean", "std", "min", "max"], columns=num_cols, dtype="float64")
+        desc.loc["count"] = cnt_s.astype("float64")
+        desc.loc["mean"] = mean_s
+        desc.loc["std"] = std_s
+        desc.loc["min"] = mn_s
+        desc.loc["max"] = mx_s
+
+        med = ddf[num_cols].median_approximate().compute()
+        desc.loc["median_approx"] = med
+        out["summary"] = desc
+
+        out["top_variance"] = var_s.sort_values(ascending=False).head(topk)
 
     if target_col and target_col in ddf.columns:
         out["target_series"] = ddf[target_col].compute()
@@ -292,28 +344,10 @@ def main() -> None:
     # Timings
     (outdir / "timings.json").write_text(json.dumps(timings, indent=2), encoding="utf-8")
 
-    # Console summary
-    print("\nDATASET OVERVIEW")
-    print(f"rows: {d_res['rows']}")
-    print(f"cols: {d_res['cols']}")
-    print(f"numeric_cols: {d_res['n_numeric']}")
-    print(f"outdir: {outdir.resolve()}")
-
-    print("\nTARGET")
-    print(target_col if target_col else "NOT FOUND")
-
-    print("\nTOP MISSING (fraction)")
-    print(pd.Series(d_res["missing"]).head(15))
-
-    print(f"\nTOP {args.topk} VARIANCE (Dask)")
-    print(pd.Series(d_res["top_variance"]))
-
-    if group_key:
-        print(f"\nGROUP KEY USED\n{group_key}")
-
-    print("\nTIMINGS (seconds)")
-    for k in sorted(timings):
-        print(f"{k}: {timings[k]:.4f}")
+    print("\nTask 3: EDA report")
+    print(json.dumps(timings, indent=2))
+    print(f"rows={d_res['rows']}, cols={d_res['cols']}, numeric={d_res['n_numeric']}")
+    print(f"Artifacts in: {outdir.resolve()}")
 
 
 if __name__ == "__main__":
