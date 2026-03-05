@@ -1,3 +1,4 @@
+# load_and_benchmark.py
 """
 load_and_benchmark.py
 
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import time
 import tracemalloc
+import resource
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -282,21 +284,21 @@ def load_dask(
     Returns
     -------
     dask.dataframe.DataFrame
-        Dask DataFrame with one partition per patient (schema-aligned).
+        Dask DataFrame with one row per patient.
     """
     root = Path(data_folder)
     patient_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
 
-    meta = build_meta_from_sample(data_folder, which=which, id_col=id_col)
+    meta = build_meta_from_sample(root, which=which, id_col=id_col)
     expected_cols = list(meta.columns)
 
-    def patient_to_row_fixed(patient_dir: Path) -> pd.DataFrame:
+    def patient_to_row_fixed(pdir: Path) -> pd.DataFrame:
+        """Partition function: always returns a DataFrame matching meta schema."""
         try:
-            one = patient_to_row(patient_dir, which=which, id_col=id_col)
+            one = patient_to_row(pdir, which=which, id_col=id_col)
+            if one.empty:
+                return meta.copy()
         except Exception:
-            return meta.copy()
-
-        if one.empty:
             return meta.copy()
 
         # Ensure exact schema match for all partitions
@@ -332,16 +334,28 @@ def bench_call(fn, *args, **kwargs) -> Tuple[Any, float, float]:
     tuple[Any, float, float]
         Function output, execution time (seconds), and peak memory usage (MB).
     """
+    # tracemalloc tracks Python allocations; ru_maxrss tracks process RSS peak.
+    # For a simple, dependency-free benchmark we report the larger of:
+    # - tracemalloc peak (Python heap)
+    # - delta ru_maxrss peak (process memory, as reported by the OS)
+    before_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
     tracemalloc.start()
     t0 = time.perf_counter()
 
     out = fn(*args, **kwargs)
 
     t1 = time.perf_counter()
-    snap = tracemalloc.take_snapshot()
+    _, peak_py_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    peak_mb = sum(stat.size for stat in snap.statistics("filename")) / (1024 * 1024)
+    after_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    delta_rss_kb = max(0.0, float(after_rss_kb - before_rss_kb))
+
+    peak_py_mb = float(peak_py_bytes) / (1024 * 1024)
+    peak_rss_mb = float(delta_rss_kb) / 1024.0  # ru_maxrss is KB on Linux
+
+    peak_mb = max(peak_py_mb, peak_rss_mb)
     return out, (t1 - t0), peak_mb
 
 
