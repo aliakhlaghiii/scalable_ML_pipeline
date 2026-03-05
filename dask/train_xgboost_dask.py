@@ -1,3 +1,4 @@
+# train_xgboost_dask.py
 """
 train_xgboost_dask.py
 
@@ -89,116 +90,67 @@ def auc_multiclass_ovr(
     in the test split), the function falls back to computing AUC
     per class and averaging the results.
     """
-
-    out: Dict[str, Any] = {
-        "auc_macro_ovr": None,
-        "auc_weighted_ovr": None,
-        "auc_per_class": {},
-    }
-
     try:
-        out["auc_macro_ovr"] = float(
-            roc_auc_score(y_true, proba, multi_class="ovr", average="macro")
+        auc = roc_auc_score(
+            y_true,
+            proba,
+            multi_class="ovr",
+            average="macro",
         )
-        out["auc_weighted_ovr"] = float(
-            roc_auc_score(y_true, proba, multi_class="ovr", average="weighted")
-        )
-        return out
+        return {"auc_ovr_macro": float(auc), "auc_fallback_used": False}
     except Exception:
-        # sklearn can fail when some classes are missing in the test set
-        pass
-
-    # fallback: compute one-vs-rest AUC manually
-    y_true = y_true.astype(int)
-    present = set(np.unique(y_true).tolist())
-
-    aucs = []
-    weights = []
-
-    for k in range(n_classes):
-
-        # skip classes not present in test labels
-        if k not in present:
-            continue
-
-        y_bin = (y_true == k).astype(int)
-
-        # skip degenerate cases (only one label)
-        if y_bin.min() == y_bin.max():
-            continue
-
-        try:
-            a = float(roc_auc_score(y_bin, proba[:, k]))
-            out["auc_per_class"][str(k)] = a
-            aucs.append(a)
-            weights.append(int(y_bin.sum()))
-        except Exception:
-            continue
-
-    if aucs:
-        out["auc_macro_ovr"] = float(np.mean(aucs))
-        out["auc_weighted_ovr"] = float(
-            np.average(aucs, weights=weights)
-        ) if sum(weights) > 0 else float(np.mean(aucs))
-
-    return out
+        aucs: List[float] = []
+        for k in range(int(n_classes)):
+            yk = (y_true == k).astype(int)
+            # if class absent or all present -> undefined AUC; skip
+            if yk.sum() == 0 or yk.sum() == len(yk):
+                continue
+            try:
+                aucs.append(float(roc_auc_score(yk, proba[:, k])))
+            except Exception:
+                continue
+        auc_mean = float(np.mean(aucs)) if aucs else float("nan")
+        return {"auc_ovr_macro": auc_mean, "auc_fallback_used": True, "auc_classes_used": len(aucs)}
 
 
 def main() -> None:
-    """Train XGBoost with Dask, evaluate performance, and save artifacts."""
-
+    """Train model, evaluate and write artifacts."""
     args = parse_args()
-
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Start local distributed Dask cluster
     cluster = LocalCluster(
-        n_workers=args.n_workers,
-        threads_per_worker=args.threads_per_worker,
+        n_workers=int(args.n_workers),
+        threads_per_worker=int(args.threads_per_worker),
         processes=True,
-        dashboard_address=None,  # disable dashboard to avoid port conflicts
+        dashboard_address=None,
     )
-
     client = Client(cluster)
 
-    # Load train/test datasets
-    dtrain = dd.read_parquet(args.train).repartition(
-        npartitions=max(1, args.n_workers)
-    )  # ensure partitions match worker count
+    # Load datasets
+    dtrain = dd.read_parquet(args.train)
+    dtest = dd.read_parquet(args.test)
 
-    dtest = dd.read_parquet(args.test).repartition(
-        npartitions=max(1, args.n_workers)
-    )
+    if args.target_col not in dtrain.columns:
+        raise SystemExit(f"Target column not found in train: {args.target_col}")
 
-    if args.target_col not in dtrain.columns or args.target_col not in dtest.columns:
-        raise SystemExit(f"Missing target column '{args.target_col}' in train/test.")
+    feats = feature_cols(list(dtrain.columns), target_col=args.target_col, id_col=args.id_col)
 
-    feats = feature_cols(list(dtrain.columns), args.target_col, args.id_col)
-
-    # Convert Dask DataFrame
     X_train = dtrain[feats].to_dask_array(lengths=True)
-    y_train = dtrain[args.target_col].astype("int64").to_dask_array(lengths=True)
+    y_train = dtrain[args.target_col].to_dask_array(lengths=True)
 
     X_test = dtest[feats].to_dask_array(lengths=True)
-    y_test = dtest[args.target_col].astype("int64").to_dask_array(lengths=True)
+    y_test = dtest[args.target_col].to_dask_array(lengths=True)
 
-    # Compute number of classes from both datasets
-    n_classes = int(
-        dd.concat([dtrain[args.target_col], dtest[args.target_col]])
-        .nunique()
-        .compute()
-    )
-
-    # Minimal parameters for multiclass classification
+    # Model params: keep defaults except required multiclass + seed
+    n_classes = int(dtrain[args.target_col].nunique().compute())
     params = {
-        "objective": "multi:softprob",  # return class probabilities
+        "objective": "multi:softprob",
         "num_class": n_classes,
         "eval_metric": "mlogloss",
-        "seed": args.seed,
+        "seed": int(args.seed),
     }
 
-    # Dask-aware data matrix
     dtrain_mat = dxgb.DaskDMatrix(client, X_train, y_train)
 
     # Training
@@ -218,10 +170,12 @@ def main() -> None:
     # Inference
     t1 = time.perf_counter()
 
+    dtest_mat = dxgb.DaskDMatrix(client, X_test)
+
     proba_d = dxgb.predict(
         client,
         booster,
-        X_test,
+        dtest_mat,
     )  # returns Dask array
 
     proba = proba_d.compute()  # collect predictions locally
